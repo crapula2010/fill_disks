@@ -1,6 +1,7 @@
-# Main source folders (supports local paths and SMB/UNC paths).
+# Main source folders (supports local paths and SMB URLs).
+# Use smb:// for Android compatibility, or local paths for mounted folders.
 sources:
-  - "\\\\192.168.68.57\\pauli\\envryone\\music"
+  - "smb://192.168.68.57/pauli/envryone/music"
 
 # Real filesystem mount paths on Android, not UI labels.
 # Replace these with your actual SD card mount points.
