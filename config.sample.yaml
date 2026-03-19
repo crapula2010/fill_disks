@@ -1,13 +1,13 @@
 # Main source folders (supports local paths and SMB URLs).
 # Use smb:// for Android compatibility, or local paths for mounted folders.
 sources:
-  - "smb://192.168.68.57/pauli/envryone/music"
+  - "smb://192.168.68.57/pauli/everyone/music"
 
 # Real filesystem mount paths on Android, not UI labels.
 # Replace these with your actual SD card mount points.
 targets:
-  - "/storage/1234-5678"
-  - "/storage/ABCD-EF12"
+  - "/storage/external_sd1"
+  - "/storage/external_sd2"
 
 # Runtime options. CLI flags override these values.
 options:
