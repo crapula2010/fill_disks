@@ -2,5 +2,6 @@ p3venv/
 .venv/
 __pycache__/
 *.pyc
+.vscode/
 config.yaml
 config.yml

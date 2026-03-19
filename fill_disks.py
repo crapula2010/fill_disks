@@ -24,6 +24,7 @@ INTERNAL_STORAGE_PREFIXES = (
     "/mnt/shell/emulated",
 )
 DEFAULT_CONFIG_FILENAMES = ("config.yaml", "config.yml")
+SAMPLE_CONFIG_FILENAMES = ("config.sample.yaml", "config.sample.yml")
 
 
 @dataclass(frozen=True)
@@ -182,6 +183,13 @@ def import_yaml():
 
 def discover_default_config_path() -> Optional[str]:
     for candidate in DEFAULT_CONFIG_FILENAMES:
+        if Path(candidate).is_file():
+            return candidate
+    return None
+
+
+def discover_sample_config_path() -> Optional[str]:
+    for candidate in SAMPLE_CONFIG_FILENAMES:
         if Path(candidate).is_file():
             return candidate
     return None
@@ -735,6 +743,15 @@ def main() -> int:
 
     try:
         config_path = args.config or discover_default_config_path()
+        if not config_path and not args.source and not args.list_targets:
+            sample_config_path = discover_sample_config_path()
+            if sample_config_path:
+                print(
+                    "[WARN] No config.yaml/config.yml found. "
+                    + f"Copy {sample_config_path} to config.yaml and edit values.",
+                    file=sys.stderr,
+                )
+
         config: dict[str, Any] = {}
         if config_path:
             config = load_yaml_config(config_path)
