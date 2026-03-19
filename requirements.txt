@@ -1,0 +1,3 @@
+# Needed only when using SMB/UNC source paths such as \\server\share\folder
+smbprotocol>=1.12.0
+PyYAML>=6.0.0

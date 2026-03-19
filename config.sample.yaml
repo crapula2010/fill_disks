@@ -1,0 +1,28 @@
+# Main source folders (supports local paths and SMB/UNC paths).
+sources:
+  - "\\\\192.168.68.57\\pauli\\envryone\\music"
+
+# Real filesystem mount paths on Android, not UI labels.
+# Replace these with your actual SD card mount points.
+targets:
+  - "/storage/1234-5678"
+  - "/storage/ABCD-EF12"
+
+# Runtime options. CLI flags override these values.
+options:
+  reserve_mb: 256
+  auto_detect_targets: true
+  execute: false
+  allow_internal: false
+  overwrite: false
+  verbose: true
+  plan_output: "plan.jsonl"
+  # seed: 12345
+  # max_files: 1000
+
+# SMB credentials are optional here.
+# You can also set SMB_USERNAME / SMB_PASSWORD / SMB_DOMAIN env vars.
+smb:
+  username: ""
+  password: ""
+  domain: ""

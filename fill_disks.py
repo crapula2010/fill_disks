@@ -1,0 +1,907 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import ntpath
+import os
+import random
+import re
+import shutil
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable, Iterator, Optional
+from urllib.parse import unquote, urlparse
+
+CHUNK_SIZE = 1024 * 1024
+DEFAULT_RESERVE_MB = 256
+INTERNAL_STORAGE_PREFIXES = (
+    "/storage/emulated",
+    "/storage/self",
+    "/sdcard",
+    "/mnt/shell/emulated",
+)
+DEFAULT_CONFIG_FILENAMES = ("config.yaml", "config.yml")
+
+
+@dataclass(frozen=True)
+class SourceSpec:
+    root: str
+    alias: str
+    kind: str  # local or smb
+
+
+@dataclass(frozen=True)
+class SourceFile:
+    source_alias: str
+    source_root: str
+    source_path: str
+    relative_path: str
+    size: int
+    mtime: Optional[float]
+    kind: str
+
+
+@dataclass
+class TargetState:
+    root: Path
+    free_bytes: int
+    reserve_bytes: int
+    usable_bytes: int
+    remaining_bytes: int
+    planned_bytes: int = 0
+    planned_files: int = 0
+
+
+@dataclass(frozen=True)
+class PlannedCopy:
+    entry: SourceFile
+    target_root: Path
+    destination_path: Path
+
+
+def format_bytes(size: int) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    value = float(size)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.2f} {unit}"
+        value /= 1024
+    return f"{size} B"
+
+
+def is_smb_source(path: str) -> bool:
+    lowered = path.lower()
+    return path.startswith("\\\\") or path.startswith("//") or lowered.startswith("smb://")
+
+
+def smb_url_to_unc(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme.lower() != "smb":
+        raise ValueError(f"Unsupported SMB URL: {url}")
+    if not parsed.hostname:
+        raise ValueError(f"SMB URL is missing hostname: {url}")
+    share_and_path = unquote(parsed.path).lstrip("/")
+    if not share_and_path:
+        raise ValueError(f"SMB URL is missing share/path: {url}")
+    return "\\\\" + parsed.hostname + "\\" + share_and_path.replace("/", "\\")
+
+
+def sanitize_alias(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
+    cleaned = cleaned.strip("._")
+    return cleaned or "source"
+
+
+def make_source_alias(source: str, index: int, used_aliases: set[str]) -> str:
+    trimmed = source.rstrip("\\/")
+    parts = [part for part in re.split(r"[\\/]+", trimmed) if part]
+    base = parts[-1] if parts else f"source_{index}"
+    alias = sanitize_alias(base)
+    if alias in used_aliases:
+        suffix = 2
+        while f"{alias}_{suffix}" in used_aliases:
+            suffix += 1
+        alias = f"{alias}_{suffix}"
+    used_aliases.add(alias)
+    return alias
+
+
+def build_source_specs(raw_sources: list[str]) -> list[SourceSpec]:
+    specs: list[SourceSpec] = []
+    used_aliases: set[str] = set()
+
+    for index, raw_source in enumerate(raw_sources, start=1):
+        source = raw_source.strip()
+        if not source:
+            continue
+
+        if source.lower().startswith("smb://"):
+            source = smb_url_to_unc(source)
+
+        kind = "smb" if is_smb_source(source) else "local"
+        if kind == "local":
+            source = str(Path(os.path.expanduser(source)).resolve())
+            if not os.path.isdir(source):
+                raise RuntimeError(f"Source folder not found: {source}")
+
+        alias = make_source_alias(source, index, used_aliases)
+        specs.append(SourceSpec(root=source, alias=alias, kind=kind))
+
+    if not specs:
+        raise RuntimeError("At least one source folder is required.")
+
+    return specs
+
+
+def import_smbclient():
+    try:
+        import smbclient  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "SMB source detected, but smbprotocol is not installed. Install with: pip install smbprotocol"
+        ) from exc
+    return smbclient
+
+
+def configure_smb_client(
+    smbclient,
+    username: Optional[str],
+    password: Optional[str],
+    domain: Optional[str],
+) -> None:
+    username = (username or "").strip() or os.getenv("SMB_USERNAME")
+    password = (password or "").strip() or os.getenv("SMB_PASSWORD")
+    domain = (domain or "").strip() or os.getenv("SMB_DOMAIN")
+
+    config: dict[str, str] = {}
+    if username:
+        config["username"] = username
+    if password:
+        config["password"] = password
+    if domain:
+        config["domain"] = domain
+
+    if config:
+        smbclient.ClientConfig(**config)
+
+
+def import_yaml():
+    try:
+        import yaml  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "Config file support requires PyYAML. Install with: pip install pyyaml"
+        ) from exc
+    return yaml
+
+
+def discover_default_config_path() -> Optional[str]:
+    for candidate in DEFAULT_CONFIG_FILENAMES:
+        if Path(candidate).is_file():
+            return candidate
+    return None
+
+
+def load_yaml_config(path: str) -> dict[str, Any]:
+    yaml = import_yaml()
+    config_path = Path(path)
+
+    if not config_path.is_file():
+        raise RuntimeError(f"Config file not found: {path}")
+
+    try:
+        with config_path.open("r", encoding="utf-8") as handle:
+            payload = yaml.safe_load(handle) or {}
+    except OSError as exc:
+        raise RuntimeError(f"Cannot read config file {path}: {exc}") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Config file is not valid YAML: {path} ({exc})") from exc
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("Config file must contain a top-level mapping/object.")
+
+    return payload
+
+
+def get_config_section(config: dict[str, Any], key: str) -> dict[str, Any]:
+    value = config.get(key)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise RuntimeError(f"Config key '{key}' must be a mapping/object.")
+    return value
+
+
+def get_config_value(config: dict[str, Any], key: str, *aliases: str) -> Any:
+    names = (key, *aliases)
+    options = get_config_section(config, "options")
+
+    for name in names:
+        if name in config:
+            return config[name]
+    for name in names:
+        if name in options:
+            return options[name]
+
+    return None
+
+
+def parse_config_list(value: Any, key_name: str) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        items = value
+    elif isinstance(value, dict):
+        raise RuntimeError(f"Config key '{key_name}' must be a string or list of strings.")
+    else:
+        items = [value]
+
+    result: list[str] = []
+    for item in items:
+        if item is None:
+            continue
+        text = str(item).strip()
+        if text:
+            result.append(text)
+
+    return result
+
+
+def parse_config_bool(value: Any, key_name: str) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    raise RuntimeError(f"Config key '{key_name}' must be a boolean value.")
+
+
+def parse_config_int(value: Any, key_name: str) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise RuntimeError(f"Config key '{key_name}' must be an integer.")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return int(text)
+        except ValueError as exc:
+            raise RuntimeError(f"Config key '{key_name}' must be an integer.") from exc
+    raise RuntimeError(f"Config key '{key_name}' must be an integer.")
+
+
+def parse_config_str(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def pick_value(cli_value: Any, config_value: Any, default: Any) -> Any:
+    if cli_value is not None:
+        return cli_value
+    if config_value is not None:
+        return config_value
+    return default
+
+
+def iter_local_files(spec: SourceSpec) -> Iterator[SourceFile]:
+    root = Path(spec.root)
+
+    for dirpath, _, filenames in os.walk(root):
+        for filename in filenames:
+            file_path = Path(dirpath) / filename
+            try:
+                stat_info = file_path.stat()
+            except OSError as exc:
+                print(f"[WARN] Cannot stat file: {file_path} ({exc})", file=sys.stderr)
+                continue
+
+            relative_path = file_path.relative_to(root).as_posix()
+            yield SourceFile(
+                source_alias=spec.alias,
+                source_root=spec.root,
+                source_path=str(file_path),
+                relative_path=relative_path,
+                size=stat_info.st_size,
+                mtime=stat_info.st_mtime,
+                kind="local",
+            )
+
+
+def iter_smb_files(spec: SourceSpec, smbclient) -> Iterator[SourceFile]:
+    root = spec.root.rstrip("\\/")
+
+    try:
+        walker = smbclient.walk(root)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Cannot access SMB source {spec.root}: {exc}") from exc
+
+    for dirpath, _, filenames in walker:
+        for filename in filenames:
+            smb_path = ntpath.join(dirpath, filename)
+            try:
+                stat_info = smbclient.stat(smb_path)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[WARN] Cannot stat SMB file: {smb_path} ({exc})", file=sys.stderr)
+                continue
+
+            relative_path = ntpath.relpath(smb_path, root).replace("\\", "/")
+            yield SourceFile(
+                source_alias=spec.alias,
+                source_root=spec.root,
+                source_path=smb_path,
+                relative_path=relative_path,
+                size=stat_info.st_size,
+                mtime=getattr(stat_info, "st_mtime", None),
+                kind="smb",
+            )
+
+
+def iter_source_files(specs: list[SourceSpec], smbclient) -> Iterator[SourceFile]:
+    for spec in specs:
+        if spec.kind == "local":
+            yield from iter_local_files(spec)
+        else:
+            yield from iter_smb_files(spec, smbclient)
+
+
+def decode_mount_field(field: str) -> str:
+    return (
+        field.replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+    )
+
+
+def is_probably_internal_storage(path: str) -> bool:
+    normalized = os.path.realpath(path).lower()
+    for prefix in INTERNAL_STORAGE_PREFIXES:
+        if normalized == prefix or normalized.startswith(prefix + "/"):
+            return True
+    return False
+
+
+def detect_android_external_mounts() -> list[str]:
+    mounts: set[str] = set()
+    proc_mounts = Path("/proc/mounts")
+    if not proc_mounts.exists():
+        return []
+
+    try:
+        lines = proc_mounts.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+
+        mount_point = decode_mount_field(parts[1])
+        if not mount_point.startswith("/storage/"):
+            continue
+        if is_probably_internal_storage(mount_point):
+            continue
+
+        real_mount = os.path.realpath(mount_point)
+        if not os.path.isdir(real_mount):
+            continue
+        if not os.access(real_mount, os.W_OK):
+            continue
+
+        mounts.add(real_mount)
+
+    return sorted(mounts)
+
+
+def resolve_targets(raw_targets: list[str], auto_detect: bool, allow_internal: bool) -> list[str]:
+    candidates = list(raw_targets)
+    if auto_detect or not candidates:
+        candidates.extend(detect_android_external_mounts())
+
+    if not candidates:
+        raise RuntimeError(
+            "No target folders were provided and no external Android storage targets were detected."
+        )
+
+    resolved: list[str] = []
+    seen: set[str] = set()
+
+    for candidate in candidates:
+        expanded = os.path.expanduser(candidate)
+        real_path = os.path.realpath(expanded)
+
+        if not os.path.isdir(real_path):
+            print(f"[WARN] Skipping missing target folder: {candidate}", file=sys.stderr)
+            continue
+        if not os.access(real_path, os.W_OK):
+            print(f"[WARN] Skipping non-writable target folder: {real_path}", file=sys.stderr)
+            continue
+        if is_probably_internal_storage(real_path) and not allow_internal:
+            print(f"[WARN] Skipping internal storage target: {real_path}", file=sys.stderr)
+            continue
+        if real_path in seen:
+            continue
+
+        seen.add(real_path)
+        resolved.append(real_path)
+
+    if not resolved:
+        raise RuntimeError("No usable target folders remain after validation.")
+
+    return resolved
+
+
+def build_target_states(targets: list[str], reserve_mb: int) -> list[TargetState]:
+    reserve_bytes = max(reserve_mb, 0) * 1024 * 1024
+    states: list[TargetState] = []
+
+    for target in targets:
+        usage = shutil.disk_usage(target)
+        usable = max(usage.free - reserve_bytes, 0)
+        states.append(
+            TargetState(
+                root=Path(target),
+                free_bytes=usage.free,
+                reserve_bytes=reserve_bytes,
+                usable_bytes=usable,
+                remaining_bytes=usable,
+            )
+        )
+
+    return states
+
+
+def split_relative_path(relative_path: str) -> list[str]:
+    parts = [part for part in re.split(r"[\\/]+", relative_path) if part and part not in {".", ".."}]
+    if not parts:
+        return [sanitize_alias(relative_path)]
+    return parts
+
+
+def choose_target(
+    target_states: list[TargetState],
+    file_size: int,
+    rng: random.Random,
+) -> Optional[TargetState]:
+    candidates = [state for state in target_states if state.remaining_bytes >= file_size]
+    if not candidates:
+        return None
+
+    best_gap = min(state.remaining_bytes - file_size for state in candidates)
+    best_candidates = [
+        state for state in candidates if (state.remaining_bytes - file_size) == best_gap
+    ]
+    return rng.choice(best_candidates)
+
+
+def build_plan(
+    files: Iterable[SourceFile],
+    target_states: list[TargetState],
+    rng: random.Random,
+    max_files: Optional[int],
+) -> tuple[list[PlannedCopy], int]:
+    pool = list(files)
+    rng.shuffle(pool)
+
+    plan: list[PlannedCopy] = []
+    unplaced_count = 0
+
+    for entry in pool:
+        if max_files is not None and len(plan) >= max_files:
+            break
+
+        target = choose_target(target_states, entry.size, rng)
+        if target is None:
+            unplaced_count += 1
+            continue
+
+        destination = target.root / entry.source_alias
+        for part in split_relative_path(entry.relative_path):
+            destination = destination / part
+
+        target.remaining_bytes -= entry.size
+        target.planned_bytes += entry.size
+        target.planned_files += 1
+
+        plan.append(PlannedCopy(entry=entry, target_root=target.root, destination_path=destination))
+
+    return plan, unplaced_count
+
+
+def next_available_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+
+    stem = path.stem
+    suffix = path.suffix
+    index = 1
+
+    while True:
+        candidate = path.with_name(f"{stem} ({index}){suffix}")
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
+def write_plan_file(plan_path: str, plan: list[PlannedCopy]) -> None:
+    output = Path(plan_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    with output.open("w", encoding="utf-8") as handle:
+        for item in plan:
+            record = {
+                "source": item.entry.source_path,
+                "destination": str(item.destination_path),
+                "size_bytes": item.entry.size,
+                "source_alias": item.entry.source_alias,
+            }
+            handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+
+
+def execute_plan(
+    plan: list[PlannedCopy],
+    smbclient,
+    overwrite: bool,
+    verbose: bool,
+) -> tuple[int, int, int, int]:
+    copied_files = 0
+    copied_bytes = 0
+    skipped_existing = 0
+    failed_files = 0
+
+    for index, item in enumerate(plan, start=1):
+        destination = item.destination_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+
+        if destination.exists() and not overwrite:
+            try:
+                if destination.stat().st_size == item.entry.size:
+                    skipped_existing += 1
+                    if verbose:
+                        print(f"[SKIP] Already exists: {destination}")
+                    continue
+            except OSError:
+                pass
+            destination = next_available_path(destination)
+
+        try:
+            if item.entry.kind == "local":
+                shutil.copy2(item.entry.source_path, destination)
+            else:
+                if smbclient is None:
+                    raise RuntimeError("SMB client not initialized")
+                with smbclient.open_file(item.entry.source_path, mode="rb") as source_handle, open(
+                    destination, "wb"
+                ) as destination_handle:
+                    shutil.copyfileobj(source_handle, destination_handle, CHUNK_SIZE)
+                if item.entry.mtime is not None:
+                    os.utime(destination, (time.time(), item.entry.mtime))
+
+            copied_files += 1
+            copied_bytes += item.entry.size
+
+            if verbose or index % 25 == 0:
+                print(
+                    f"[COPY] {index}/{len(plan)} files | Copied {format_bytes(copied_bytes)}"
+                )
+
+        except Exception as exc:  # noqa: BLE001
+            failed_files += 1
+            print(
+                f"[ERROR] Copy failed: {item.entry.source_path} -> {destination} ({exc})",
+                file=sys.stderr,
+            )
+
+    return copied_files, copied_bytes, skipped_existing, failed_files
+
+
+def print_target_summary(target_states: list[TargetState]) -> None:
+    print("Target summary:")
+    for state in target_states:
+        print(
+            "  "
+            + f"{state.root} | free={format_bytes(state.free_bytes)} "
+            + f"reserve={format_bytes(state.reserve_bytes)} "
+            + f"planned={format_bytes(state.planned_bytes)} "
+            + f"remaining={format_bytes(state.remaining_bytes)}"
+        )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Fill one or more target folders with a random selection of files from source folders "
+            "until targets are full. Internal Android storage is excluded by default."
+        )
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help=(
+            "Path to YAML config file. If omitted, config.yaml or config.yml is used when present. "
+            "CLI flags override config values."
+        ),
+    )
+    parser.add_argument(
+        "--source",
+        action="append",
+        required=False,
+        help="Source folder path. Repeat for multiple sources. Supports local paths and SMB/UNC paths.",
+    )
+    parser.add_argument(
+        "--target",
+        action="append",
+        help="Target folder path. Repeat for multiple targets. If omitted, Android external mounts are auto-detected.",
+    )
+    parser.add_argument(
+        "--auto-detect-targets",
+        action="store_true",
+        default=None,
+        help="Add detected Android external mount points to the target list.",
+    )
+    parser.add_argument(
+        "--list-targets",
+        action="store_true",
+        default=None,
+        help="List detected Android external storage mount points and exit.",
+    )
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        default=None,
+        help="Perform file copies. Default behavior is dry-run planning only.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional random seed for repeatable file selection.",
+    )
+    parser.add_argument(
+        "--reserve-mb",
+        type=int,
+        default=None,
+        help="Reserve this much free space on each target (default: 256 MB).",
+    )
+    parser.add_argument(
+        "--max-files",
+        type=int,
+        default=None,
+        help="Optional cap on number of files to include in the plan.",
+    )
+    parser.add_argument(
+        "--plan-output",
+        default=None,
+        help="Optional output file path for the generated copy plan (JSON lines).",
+    )
+    parser.add_argument(
+        "--allow-internal",
+        action="store_true",
+        default=None,
+        help="Allow internal storage targets (/storage/emulated, /sdcard).",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        default=None,
+        help="Overwrite destination files with the same name. Default keeps existing files.",
+    )
+    parser.add_argument(
+        "--smb-username",
+        default=None,
+        help="SMB username. Can also be set via SMB_USERNAME environment variable.",
+    )
+    parser.add_argument(
+        "--smb-password",
+        default=None,
+        help="SMB password. Can also be set via SMB_PASSWORD environment variable.",
+    )
+    parser.add_argument(
+        "--smb-domain",
+        default=None,
+        help="SMB domain/workgroup. Can also be set via SMB_DOMAIN environment variable.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        default=None,
+        help="Print more progress details.",
+    )
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    try:
+        config_path = args.config or discover_default_config_path()
+        config: dict[str, Any] = {}
+        if config_path:
+            config = load_yaml_config(config_path)
+            print(f"Using config file: {config_path}")
+
+        source_values = args.source
+        if not source_values:
+            source_values = parse_config_list(
+                get_config_value(config, "sources", "source"),
+                "sources",
+            )
+
+        target_values = args.target
+        if not target_values:
+            target_values = parse_config_list(
+                get_config_value(config, "targets", "target"),
+                "targets",
+            )
+
+        list_targets = pick_value(
+            args.list_targets,
+            parse_config_bool(get_config_value(config, "list_targets"), "list_targets"),
+            False,
+        )
+        auto_detect_targets = pick_value(
+            args.auto_detect_targets,
+            parse_config_bool(
+                get_config_value(config, "auto_detect_targets", "auto-detect-targets"),
+                "auto_detect_targets",
+            ),
+            False,
+        )
+        execute = pick_value(
+            args.execute,
+            parse_config_bool(get_config_value(config, "execute"), "execute"),
+            False,
+        )
+        allow_internal = pick_value(
+            args.allow_internal,
+            parse_config_bool(get_config_value(config, "allow_internal", "allow-internal"), "allow_internal"),
+            False,
+        )
+        overwrite = pick_value(
+            args.overwrite,
+            parse_config_bool(get_config_value(config, "overwrite"), "overwrite"),
+            False,
+        )
+        verbose = pick_value(
+            args.verbose,
+            parse_config_bool(get_config_value(config, "verbose"), "verbose"),
+            False,
+        )
+        reserve_mb = pick_value(
+            args.reserve_mb,
+            parse_config_int(get_config_value(config, "reserve_mb", "reserve-mb"), "reserve_mb"),
+            DEFAULT_RESERVE_MB,
+        )
+        seed = pick_value(
+            args.seed,
+            parse_config_int(get_config_value(config, "seed"), "seed"),
+            None,
+        )
+        max_files = pick_value(
+            args.max_files,
+            parse_config_int(get_config_value(config, "max_files", "max-files"), "max_files"),
+            None,
+        )
+        plan_output = pick_value(
+            args.plan_output,
+            parse_config_str(get_config_value(config, "plan_output", "plan-output")),
+            None,
+        )
+
+        smb_config = get_config_section(config, "smb")
+        smb_username = pick_value(
+            args.smb_username,
+            parse_config_str(smb_config.get("username") or smb_config.get("user")),
+            None,
+        )
+        smb_password = pick_value(
+            args.smb_password,
+            parse_config_str(smb_config.get("password")),
+            None,
+        )
+        smb_domain = pick_value(
+            args.smb_domain,
+            parse_config_str(smb_config.get("domain") or smb_config.get("workgroup")),
+            None,
+        )
+
+        if list_targets:
+            detected_targets = detect_android_external_mounts()
+            if not detected_targets:
+                print("No external Android storage mount points detected.")
+            else:
+                print("Detected external Android storage mount points:")
+                for target in detected_targets:
+                    print(f"  {target}")
+            return 0
+
+        if not source_values:
+            parser.error("--source is required unless --list-targets is used.")
+
+        source_specs = build_source_specs(source_values)
+
+        requires_smb = any(spec.kind == "smb" for spec in source_specs)
+        smbclient = None
+        if requires_smb:
+            smbclient = import_smbclient()
+            configure_smb_client(smbclient, smb_username, smb_password, smb_domain)
+
+        target_paths = resolve_targets(
+            raw_targets=target_values or [],
+            auto_detect=auto_detect_targets,
+            allow_internal=allow_internal,
+        )
+        target_states = build_target_states(target_paths, reserve_mb)
+
+        total_usable_bytes = sum(state.usable_bytes for state in target_states)
+        if total_usable_bytes <= 0:
+            raise RuntimeError(
+                "Targets have no usable free space after reserve. Reduce --reserve-mb or free space first."
+            )
+
+        print("Scanning source files...")
+        source_files = list(iter_source_files(source_specs, smbclient))
+        if not source_files:
+            raise RuntimeError("No files found in the source folders.")
+
+        source_total_bytes = sum(item.size for item in source_files)
+        rng = random.Random(seed)
+        plan, unplaced_count = build_plan(source_files, target_states, rng, max_files)
+
+        planned_total_bytes = sum(item.entry.size for item in plan)
+
+        print(f"Source files found: {len(source_files)} ({format_bytes(source_total_bytes)})")
+        print(f"Files in random copy plan: {len(plan)} ({format_bytes(planned_total_bytes)})")
+        print(f"Files that did not fit: {unplaced_count}")
+        print_target_summary(target_states)
+
+        if plan_output:
+            write_plan_file(plan_output, plan)
+            print(f"Plan written to: {plan_output}")
+
+        if not execute:
+            print("Dry-run complete. Re-run with --execute to copy files.")
+            return 0
+
+        print("Starting copy...")
+        copied_files, copied_bytes, skipped_existing, failed_files = execute_plan(
+            plan=plan,
+            smbclient=smbclient,
+            overwrite=overwrite,
+            verbose=verbose,
+        )
+
+        print("Copy complete.")
+        print(f"Copied files: {copied_files} ({format_bytes(copied_bytes)})")
+        print(f"Skipped existing: {skipped_existing}")
+        print(f"Failed copies: {failed_files}")
+
+        return 0 if failed_files == 0 else 2
+
+    except RuntimeError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

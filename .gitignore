@@ -1,0 +1,6 @@
+p3venv/
+.venv/
+__pycache__/
+*.pyc
+config.yaml
+config.yml
