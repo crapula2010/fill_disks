@@ -7,9 +7,16 @@ The script is designed for development on Windows and execution on Android (for 
 ## What it does
 
 - Reads files from one or more source folders.
+- Scans all target folders and inventories existing files.
+- Detects duplicates across target folders by relative path + size.
+- In execute mode, removes duplicate copies and keeps one copy.
+- In dry-run mode, simulates duplicate cleanup capacity for planning.
 - Measures free space on each target folder.
 - Excludes internal Android storage by default.
+- Avoids planning files that already exist in targets.
 - Builds a random copy plan that fits available target space.
+- If a destination fills during copy, retries the file on another destination.
+- Reports copy failures and continues with the remaining files.
 - Runs as dry-run by default so you can inspect before copying.
 
 ## Install
@@ -74,7 +81,7 @@ The project includes a starter template at config.sample.yaml.
 
 ```yaml
 sources:
-  - "\\\\192.168.68.57\\pauli\\envryone\\music"
+  - "smb://192.168.68.57/pauli/everyone/music"
 targets:
   - "/storage/1234-5678"
   - "/storage/ABCD-EF12"
@@ -91,7 +98,7 @@ Keep real credentials in your local config.yaml. The repository ignores config.y
 
 ```bash
 python fill_disks.py \
-  --source "\\\\192.168.68.57\\pauli\\envryone\\music" \
+  --source "smb://192.168.68.57/pauli/everyone/music" \
   --target "/storage/1234-5678" \
   --target "/storage/ABCD-EF12" \
   --smb-username "your_user" \
@@ -115,5 +122,7 @@ python fill_disks.py \
 ## Notes
 
 - Destination layout is target/source_alias/relative/path/to/file.
-- If a destination file already exists, it is skipped when size matches.
+- Existing files are identified by destination relative path + size.
+- Duplicate files across destinations are removed in execute mode (one copy is kept).
 - If a destination name conflicts and sizes differ, a numbered filename is used unless --overwrite is set.
+- If a copy fails due a full destination, the script attempts the next destination.

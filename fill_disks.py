@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import ntpath
 import os
@@ -61,6 +62,17 @@ class PlannedCopy:
     entry: SourceFile
     target_root: Path
     destination_path: Path
+
+
+FileSignature = tuple[str, int]
+
+
+@dataclass(frozen=True)
+class DestinationFile:
+    target_root: Path
+    path: Path
+    relative_path: str
+    size: int
 
 
 def format_bytes(size: int) -> str:
@@ -485,6 +497,140 @@ def split_relative_path(relative_path: str) -> list[str]:
     return parts
 
 
+def destination_relative_path_for_entry(entry: SourceFile) -> str:
+    return f"{entry.source_alias}/{entry.relative_path}".replace("\\", "/")
+
+
+def make_file_signature(relative_path: str, size: int) -> FileSignature:
+    normalized = "/".join(split_relative_path(relative_path))
+    return normalized, size
+
+
+def source_signature(entry: SourceFile) -> FileSignature:
+    return make_file_signature(destination_relative_path_for_entry(entry), entry.size)
+
+
+def destination_path_for_entry(target_root: Path, entry: SourceFile) -> Path:
+    destination = target_root
+    for part in split_relative_path(destination_relative_path_for_entry(entry)):
+        destination = destination / part
+    return destination
+
+
+def scan_destination_inventory(
+    target_paths: list[str],
+) -> tuple[
+    list[DestinationFile],
+    dict[Path, tuple[int, int]],
+    dict[FileSignature, list[DestinationFile]],
+]:
+    inventory: list[DestinationFile] = []
+    per_target_stats: dict[Path, tuple[int, int]] = {}
+    grouped: dict[FileSignature, list[DestinationFile]] = {}
+
+    for target in target_paths:
+        root = Path(target)
+        file_count = 0
+        total_bytes = 0
+
+        for dirpath, _, filenames in os.walk(root):
+            for filename in filenames:
+                file_path = Path(dirpath) / filename
+                try:
+                    stat_info = file_path.stat()
+                except OSError as exc:
+                    print(
+                        f"[WARN] Cannot stat destination file: {file_path} ({exc})",
+                        file=sys.stderr,
+                    )
+                    continue
+
+                relative_path = file_path.relative_to(root).as_posix()
+                entry = DestinationFile(
+                    target_root=root,
+                    path=file_path,
+                    relative_path=relative_path,
+                    size=stat_info.st_size,
+                )
+                inventory.append(entry)
+
+                file_count += 1
+                total_bytes += entry.size
+
+                signature = make_file_signature(relative_path, entry.size)
+                grouped.setdefault(signature, []).append(entry)
+
+        per_target_stats[root] = (file_count, total_bytes)
+
+    return inventory, per_target_stats, grouped
+
+
+def find_duplicate_destination_files(
+    grouped_inventory: dict[FileSignature, list[DestinationFile]],
+) -> tuple[list[DestinationFile], int, int]:
+    duplicates_to_remove: list[DestinationFile] = []
+    duplicate_groups = 0
+    reclaimable_bytes = 0
+
+    for entries in grouped_inventory.values():
+        if len(entries) <= 1:
+            continue
+
+        duplicate_groups += 1
+        ordered = sorted(entries, key=lambda item: str(item.path))
+        for duplicate in ordered[1:]:
+            duplicates_to_remove.append(duplicate)
+            reclaimable_bytes += duplicate.size
+
+    return duplicates_to_remove, duplicate_groups, reclaimable_bytes
+
+
+def apply_duplicate_reclaim_to_targets(
+    target_states: list[TargetState],
+    duplicates_to_remove: list[DestinationFile],
+) -> None:
+    by_root = {state.root: state for state in target_states}
+
+    for duplicate in duplicates_to_remove:
+        state = by_root.get(duplicate.target_root)
+        if state is None:
+            continue
+        state.remaining_bytes += duplicate.size
+        state.usable_bytes += duplicate.size
+
+
+def remove_duplicate_destination_files(
+    duplicates_to_remove: list[DestinationFile],
+    verbose: bool,
+) -> tuple[int, int, int]:
+    removed_count = 0
+    reclaimed_bytes = 0
+    failed_count = 0
+
+    for duplicate in duplicates_to_remove:
+        try:
+            duplicate.path.unlink()
+            removed_count += 1
+            reclaimed_bytes += duplicate.size
+            if verbose:
+                print(f"[DEDUPE] Removed duplicate: {duplicate.path}")
+        except OSError as exc:
+            failed_count += 1
+            print(
+                f"[WARN] Could not remove duplicate file: {duplicate.path} ({exc})",
+                file=sys.stderr,
+            )
+
+    return removed_count, reclaimed_bytes, failed_count
+
+
+def is_no_space_error(exc: Exception) -> bool:
+    if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+        return True
+    message = str(exc).lower()
+    return "no space left" in message or "disk full" in message
+
+
 def choose_target(
     target_states: list[TargetState],
     file_size: int,
@@ -506,33 +652,40 @@ def build_plan(
     target_states: list[TargetState],
     rng: random.Random,
     max_files: Optional[int],
-) -> tuple[list[PlannedCopy], int]:
+    existing_signatures: set[FileSignature],
+) -> tuple[list[PlannedCopy], int, int]:
     pool = list(files)
     rng.shuffle(pool)
 
     plan: list[PlannedCopy] = []
     unplaced_count = 0
+    skipped_existing_count = 0
+    seen_signatures = set(existing_signatures)
 
     for entry in pool:
         if max_files is not None and len(plan) >= max_files:
             break
+
+        signature = source_signature(entry)
+        if signature in seen_signatures:
+            skipped_existing_count += 1
+            continue
 
         target = choose_target(target_states, entry.size, rng)
         if target is None:
             unplaced_count += 1
             continue
 
-        destination = target.root / entry.source_alias
-        for part in split_relative_path(entry.relative_path):
-            destination = destination / part
+        destination = destination_path_for_entry(target.root, entry)
 
         target.remaining_bytes -= entry.size
         target.planned_bytes += entry.size
         target.planned_files += 1
+        seen_signatures.add(signature)
 
         plan.append(PlannedCopy(entry=entry, target_root=target.root, destination_path=destination))
 
-    return plan, unplaced_count
+    return plan, unplaced_count, skipped_existing_count
 
 
 def next_available_path(path: Path) -> Path:
@@ -565,8 +718,32 @@ def write_plan_file(plan_path: str, plan: list[PlannedCopy]) -> None:
             handle.write(json.dumps(record, ensure_ascii=True) + "\n")
 
 
+def ordered_copy_targets(
+    target_states: list[TargetState],
+    preferred_root: Path,
+    file_size: int,
+) -> list[TargetState]:
+    preferred: Optional[TargetState] = None
+    others: list[TargetState] = []
+
+    for state in target_states:
+        if state.root == preferred_root:
+            preferred = state
+        else:
+            others.append(state)
+
+    viable_others = sorted(others, key=lambda state: state.remaining_bytes, reverse=True)
+
+    ordered: list[TargetState] = []
+    if preferred is not None:
+        ordered.append(preferred)
+    ordered.extend(viable_others)
+    return ordered
+
+
 def execute_plan(
     plan: list[PlannedCopy],
+    target_states: list[TargetState],
     smbclient,
     overwrite: bool,
     verbose: bool,
@@ -577,45 +754,92 @@ def execute_plan(
     failed_files = 0
 
     for index, item in enumerate(plan, start=1):
-        destination = item.destination_path
-        destination.parent.mkdir(parents=True, exist_ok=True)
-
-        if destination.exists() and not overwrite:
-            try:
-                if destination.stat().st_size == item.entry.size:
-                    skipped_existing += 1
-                    if verbose:
-                        print(f"[SKIP] Already exists: {destination}")
-                    continue
-            except OSError:
-                pass
-            destination = next_available_path(destination)
-
-        try:
-            if item.entry.kind == "local":
-                shutil.copy2(item.entry.source_path, destination)
-            else:
-                if smbclient is None:
-                    raise RuntimeError("SMB client not initialized")
-                with smbclient.open_file(item.entry.source_path, mode="rb") as source_handle, open(
-                    destination, "wb"
-                ) as destination_handle:
-                    shutil.copyfileobj(source_handle, destination_handle, CHUNK_SIZE)
-                if item.entry.mtime is not None:
-                    os.utime(destination, (time.time(), item.entry.mtime))
-
-            copied_files += 1
-            copied_bytes += item.entry.size
-
-            if verbose or index % 25 == 0:
-                print(
-                    f"[COPY] {index}/{len(plan)} files | Copied {format_bytes(copied_bytes)}"
-                )
-
-        except Exception as exc:  # noqa: BLE001
+        attempted_states = ordered_copy_targets(target_states, item.target_root, item.entry.size)
+        if not attempted_states:
             failed_files += 1
             print(
-                f"[ERROR] Copy failed: {item.entry.source_path} -> {destination} ({exc})",
+                f"[ERROR] No target has enough remaining space for: {item.entry.source_path} "
+                + f"({format_bytes(item.entry.size)})",
+                file=sys.stderr,
+            )
+            continue
+
+        copied_this_file = False
+        skipped_this_file = False
+        exhausted_space_failures = 0
+
+        for state in attempted_states:
+            destination = destination_path_for_entry(state.root, item.entry)
+
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                print(
+                    f"[ERROR] Cannot create destination folder: {destination.parent} ({exc})",
+                    file=sys.stderr,
+                )
+                break
+
+            candidate_destination = destination
+            if candidate_destination.exists() and not overwrite:
+                try:
+                    if candidate_destination.stat().st_size == item.entry.size:
+                        skipped_existing += 1
+                        skipped_this_file = True
+                        if verbose:
+                            print(f"[SKIP] Already exists: {candidate_destination}")
+                        break
+                except OSError:
+                    pass
+                candidate_destination = next_available_path(candidate_destination)
+
+            try:
+                if item.entry.kind == "local":
+                    shutil.copy2(item.entry.source_path, candidate_destination)
+                else:
+                    if smbclient is None:
+                        raise RuntimeError("SMB client not initialized")
+                    with smbclient.open_file(item.entry.source_path, mode="rb") as source_handle, open(
+                        candidate_destination, "wb"
+                    ) as destination_handle:
+                        shutil.copyfileobj(source_handle, destination_handle, CHUNK_SIZE)
+                    if item.entry.mtime is not None:
+                        os.utime(candidate_destination, (time.time(), item.entry.mtime))
+
+                copied_files += 1
+                copied_bytes += item.entry.size
+                state.remaining_bytes = max(state.remaining_bytes - item.entry.size, 0)
+                copied_this_file = True
+
+                if verbose or index % 25 == 0:
+                    print(
+                        f"[COPY] {index}/{len(plan)} files | Copied {format_bytes(copied_bytes)}"
+                    )
+                break
+
+            except Exception as exc:  # noqa: BLE001
+                if is_no_space_error(exc):
+                    exhausted_space_failures += 1
+                    state.remaining_bytes = 0
+                    print(
+                        f"[WARN] Target is full, trying next destination: {state.root} ({exc})",
+                        file=sys.stderr,
+                    )
+                    continue
+
+                print(
+                    f"[ERROR] Copy failed: {item.entry.source_path} -> {candidate_destination} ({exc})",
+                    file=sys.stderr,
+                )
+                break
+
+        if skipped_this_file or copied_this_file:
+            continue
+
+        failed_files += 1
+        if exhausted_space_failures > 0:
+            print(
+                f"[ERROR] Could not copy file, all attempted destinations are full: {item.entry.source_path}",
                 file=sys.stderr,
             )
 
@@ -870,6 +1094,53 @@ def main() -> int:
         )
         target_states = build_target_states(target_paths, reserve_mb)
 
+        print("Scanning destination files...")
+        destination_inventory, destination_stats, grouped_destination_files = scan_destination_inventory(
+            target_paths
+        )
+        existing_signatures = set(grouped_destination_files.keys())
+        duplicates_to_remove, duplicate_groups, reclaimable_bytes = find_duplicate_destination_files(
+            grouped_destination_files
+        )
+
+        destination_total_bytes = sum(item.size for item in destination_inventory)
+        print(
+            f"Destination files found: {len(destination_inventory)} "
+            + f"({format_bytes(destination_total_bytes)})"
+        )
+        for target_path in target_paths:
+            root = Path(target_path)
+            file_count, target_bytes = destination_stats.get(root, (0, 0))
+            print(
+                f"  {root} | files={file_count} | existing={format_bytes(target_bytes)}"
+            )
+
+        if duplicates_to_remove:
+            print(
+                f"Duplicate files across destinations: {len(duplicates_to_remove)} "
+                + f"in {duplicate_groups} groups ({format_bytes(reclaimable_bytes)} reclaimable)"
+            )
+            if execute:
+                print("Removing duplicate destination files...")
+                removed_count, reclaimed_bytes, failed_removals = remove_duplicate_destination_files(
+                    duplicates_to_remove,
+                    verbose,
+                )
+                print(
+                    f"Duplicate cleanup: removed={removed_count} "
+                    + f"failed={failed_removals} reclaimed={format_bytes(reclaimed_bytes)}"
+                )
+                if removed_count > 0:
+                    target_states = build_target_states(target_paths, reserve_mb)
+            else:
+                apply_duplicate_reclaim_to_targets(target_states, duplicates_to_remove)
+                print(
+                    "Dry-run mode: duplicate cleanup was simulated for capacity planning. "
+                    + "Use --execute to apply removals."
+                )
+        else:
+            print("No duplicate files found across destinations.")
+
         total_usable_bytes = sum(state.usable_bytes for state in target_states)
         if total_usable_bytes <= 0:
             raise RuntimeError(
@@ -883,11 +1154,18 @@ def main() -> int:
 
         source_total_bytes = sum(item.size for item in source_files)
         rng = random.Random(seed)
-        plan, unplaced_count = build_plan(source_files, target_states, rng, max_files)
+        plan, unplaced_count, skipped_existing_count = build_plan(
+            source_files,
+            target_states,
+            rng,
+            max_files,
+            existing_signatures,
+        )
 
         planned_total_bytes = sum(item.entry.size for item in plan)
 
         print(f"Source files found: {len(source_files)} ({format_bytes(source_total_bytes)})")
+        print(f"Source files already present in destinations: {skipped_existing_count}")
         print(f"Files in random copy plan: {len(plan)} ({format_bytes(planned_total_bytes)})")
         print(f"Files that did not fit: {unplaced_count}")
         print_target_summary(target_states)
@@ -903,6 +1181,7 @@ def main() -> int:
         print("Starting copy...")
         copied_files, copied_bytes, skipped_existing, failed_files = execute_plan(
             plan=plan,
+            target_states=target_states,
             smbclient=smbclient,
             overwrite=overwrite,
             verbose=verbose,
