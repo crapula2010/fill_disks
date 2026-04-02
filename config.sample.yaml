@@ -5,9 +5,14 @@ sources:
 
 # Real filesystem mount paths on Android, not UI labels.
 # Replace these with your actual SD card mount points.
+# Each target can optionally specify its own reserve_mb to override the global value.
+# The order of targets matters: when deduplicating, earlier targets are KEPT and later ones are deleted.
+# So put your preferred storage first (e.g., internal storage should come first).
 targets:
-  - "/storage/external_sd1"
-  - "/storage/external_sd2"
+  - path: "/storage/emulated/0/Music"  # Internal storage (kept in dedup)
+  - path: "/storage/external_sd1/music"
+  - path: "/storage/external_sd2/music"
+    reserve_mb: 512
 
 # Runtime options. CLI flags override these values.
 options:

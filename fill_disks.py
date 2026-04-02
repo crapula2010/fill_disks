@@ -36,6 +36,12 @@ class SourceSpec:
 
 
 @dataclass(frozen=True)
+class TargetSpec:
+    path: str
+    reserve_mb: Optional[int] = None  # If None, uses global reserve_mb
+
+
+@dataclass(frozen=True)
 class SourceFile:
     source_alias: str
     source_root: str
@@ -313,6 +319,42 @@ def parse_config_str(value: Any) -> Optional[str]:
     return text or None
 
 
+def parse_config_targets(value: Any) -> list[TargetSpec]:
+    """Parse targets from config. Supports both strings (simple paths) and objects (with reserve_mb)."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        items = value
+    else:
+        items = [value]
+
+    specs: list[TargetSpec] = []
+    for item in items:
+        if item is None:
+            continue
+        if isinstance(item, str):
+            # Simple string target (e.g., "/storage/external_sd1")
+            text = item.strip()
+            if text:
+                specs.append(TargetSpec(path=text, reserve_mb=None))
+        elif isinstance(item, dict):
+            # Object target with optional reserve_mb (e.g., {"path": "/storage/external_sd1", "reserve_mb": 512})
+            path = item.get("path")
+            if path:
+                path = str(path).strip()
+                if path:
+                    reserve_mb = item.get("reserve_mb")
+                    if reserve_mb is not None:
+                        reserve_mb = parse_config_int(reserve_mb, "targets[].reserve_mb")
+                    specs.append(TargetSpec(path=path, reserve_mb=reserve_mb))
+        else:
+            text = str(item).strip()
+            if text:
+                specs.append(TargetSpec(path=text, reserve_mb=None))
+
+    return specs
+
+
 def pick_value(cli_value: Any, config_value: Any, default: Any) -> Any:
     if cli_value is not None:
         return cli_value
@@ -432,25 +474,26 @@ def detect_android_external_mounts() -> list[str]:
     return sorted(mounts)
 
 
-def resolve_targets(raw_targets: list[str], auto_detect: bool, allow_internal: bool) -> list[str]:
-    candidates = list(raw_targets)
+def resolve_targets(raw_targets: list[TargetSpec], auto_detect: bool, allow_internal: bool) -> list[TargetSpec]:
+    candidates: list[TargetSpec] = list(raw_targets)
     if auto_detect or not candidates:
-        candidates.extend(detect_android_external_mounts())
+        auto_detected = detect_android_external_mounts()
+        candidates.extend(TargetSpec(path=t, reserve_mb=None) for t in auto_detected)
 
     if not candidates:
         raise RuntimeError(
             "No target folders were provided and no external Android storage targets were detected."
         )
 
-    resolved: list[str] = []
+    resolved: list[TargetSpec] = []
     seen: set[str] = set()
 
     for candidate in candidates:
-        expanded = os.path.expanduser(candidate)
+        expanded = os.path.expanduser(candidate.path)
         real_path = os.path.realpath(expanded)
 
         if not os.path.isdir(real_path):
-            print(f"[WARN] Skipping missing target folder: {candidate}", file=sys.stderr)
+            print(f"[WARN] Skipping missing target folder: {candidate.path}", file=sys.stderr)
             continue
         if not os.access(real_path, os.W_OK):
             print(f"[WARN] Skipping non-writable target folder: {real_path}", file=sys.stderr)
@@ -462,7 +505,7 @@ def resolve_targets(raw_targets: list[str], auto_detect: bool, allow_internal: b
             continue
 
         seen.add(real_path)
-        resolved.append(real_path)
+        resolved.append(TargetSpec(path=real_path, reserve_mb=candidate.reserve_mb))
 
     if not resolved:
         raise RuntimeError("No usable target folders remain after validation.")
@@ -470,16 +513,19 @@ def resolve_targets(raw_targets: list[str], auto_detect: bool, allow_internal: b
     return resolved
 
 
-def build_target_states(targets: list[str], reserve_mb: int) -> list[TargetState]:
-    reserve_bytes = max(reserve_mb, 0) * 1024 * 1024
+def build_target_states(targets: list[TargetSpec], reserve_mb: int) -> list[TargetState]:
     states: list[TargetState] = []
 
-    for target in targets:
-        usage = shutil.disk_usage(target)
+    for target_spec in targets:
+        # Use per-target reserve if specified, otherwise use global reserve
+        target_reserve_mb = target_spec.reserve_mb if target_spec.reserve_mb is not None else reserve_mb
+        reserve_bytes = max(target_reserve_mb, 0) * 1024 * 1024
+        
+        usage = shutil.disk_usage(target_spec.path)
         usable = max(usage.free - reserve_bytes, 0)
         states.append(
             TargetState(
-                root=Path(target),
+                root=Path(target_spec.path),
                 free_bytes=usage.free,
                 reserve_bytes=reserve_bytes,
                 usable_bytes=usable,
@@ -567,17 +613,27 @@ def scan_destination_inventory(
 
 def find_duplicate_destination_files(
     grouped_inventory: dict[FileSignature, list[DestinationFile]],
+    target_priority: list[str],
 ) -> tuple[list[DestinationFile], int, int]:
     duplicates_to_remove: list[DestinationFile] = []
     duplicate_groups = 0
     reclaimable_bytes = 0
+
+    # Build priority map: earlier targets in list get lower index (higher priority for keeping)
+    priority_map = {target: idx for idx, target in enumerate(target_priority)}
 
     for entries in grouped_inventory.values():
         if len(entries) <= 1:
             continue
 
         duplicate_groups += 1
-        ordered = sorted(entries, key=lambda item: str(item.path))
+        # Sort by target priority: lower index (earlier in config) comes first and is kept
+        def sort_key(item: DestinationFile) -> tuple[int, str]:
+            target_path = str(item.target_root)
+            priority_idx = priority_map.get(target_path, float('inf'))
+            return (priority_idx, target_path)
+
+        ordered = sorted(entries, key=sort_key)
         for duplicate in ordered[1:]:
             duplicates_to_remove.append(duplicate)
             reclaimable_bytes += duplicate.size
@@ -988,11 +1044,14 @@ def main() -> int:
                 "sources",
             )
 
-        target_values = args.target
-        if not target_values:
-            target_values = parse_config_list(
+        target_specs: list[TargetSpec] = []
+        if args.target:
+            # CLI targets are strings, convert to TargetSpec
+            target_specs = [TargetSpec(path=t, reserve_mb=None) for t in args.target]
+        else:
+            # Load from config (can be strings or objects)
+            target_specs = parse_config_targets(
                 get_config_value(config, "targets", "target"),
-                "targets",
             )
 
         list_targets = pick_value(
@@ -1087,12 +1146,13 @@ def main() -> int:
             smbclient = import_smbclient()
             configure_smb_client(smbclient, smb_username, smb_password, smb_domain)
 
-        target_paths = resolve_targets(
-            raw_targets=target_values or [],
+        target_specs = resolve_targets(
+            raw_targets=target_specs,
             auto_detect=auto_detect_targets,
             allow_internal=allow_internal,
         )
-        target_states = build_target_states(target_paths, reserve_mb)
+        target_states = build_target_states(target_specs, reserve_mb)
+        target_paths = [spec.path for spec in target_specs]
 
         print("Scanning destination files...")
         destination_inventory, destination_stats, grouped_destination_files = scan_destination_inventory(
@@ -1100,7 +1160,7 @@ def main() -> int:
         )
         existing_signatures = set(grouped_destination_files.keys())
         duplicates_to_remove, duplicate_groups, reclaimable_bytes = find_duplicate_destination_files(
-            grouped_destination_files
+            grouped_destination_files, target_paths
         )
 
         destination_total_bytes = sum(item.size for item in destination_inventory)
