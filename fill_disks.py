@@ -485,16 +485,20 @@ def detect_android_external_mounts() -> list[str]:
     return sorted(mounts)
 
 
+def paths_overlap(path_a: str, path_b: str) -> bool:
+    norm_a = os.path.normpath(path_a)
+    norm_b = os.path.normpath(path_b)
+    try:
+        common = os.path.normpath(os.path.commonpath([norm_a, norm_b]))
+    except ValueError:
+        return False
+    return common == norm_a or common == norm_b
+
+
 def resolve_targets(raw_targets: list[TargetSpec], auto_detect: bool, allow_internal: bool) -> list[TargetSpec]:
     candidates: list[TargetSpec] = list(raw_targets)
-    if auto_detect or not candidates:
-        auto_detected = detect_android_external_mounts()
-        candidates.extend(TargetSpec(path=t, reserve_mb=None) for t in auto_detected)
-
     if not candidates:
-        raise RuntimeError(
-            "No target folders were provided and no external Android storage targets were detected."
-        )
+        return []
 
     resolved: list[TargetSpec] = []
     seen: set[str] = set()
@@ -517,9 +521,6 @@ def resolve_targets(raw_targets: list[TargetSpec], auto_detect: bool, allow_inte
 
         seen.add(real_path)
         resolved.append(TargetSpec(path=real_path, reserve_mb=candidate.reserve_mb))
-
-    if not resolved:
-        raise RuntimeError("No usable target folders remain after validation.")
 
     return resolved
 
@@ -1218,6 +1219,10 @@ def main() -> int:
                     print(f"  {target}")
             return 0
 
+        if not target_specs:
+            print("No targets configured; nothing to do.")
+            return 0
+
         if not source_values:
             parser.error("--source is required unless --list-targets is used.")
 
@@ -1234,6 +1239,10 @@ def main() -> int:
             auto_detect=auto_detect_targets,
             allow_internal=allow_internal,
         )
+        if not target_specs:
+            print("No usable targets found after validation; nothing to do.")
+            return 0
+
         target_states = build_target_states(target_specs, reserve_mb)
         target_paths = [spec.path for spec in target_specs]
 

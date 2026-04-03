@@ -17,7 +17,7 @@ targets:
 # Runtime options. CLI flags override these values.
 options:
   reserve_mb: 256
-  auto_detect_targets: true
+  auto_detect_targets: false
   execute: false
   allow_internal: true
   overwrite: false
