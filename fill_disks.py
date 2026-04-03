@@ -34,6 +34,11 @@ PROTECTED_DEDUPE_FILENAMES = {
 }
 
 
+def is_protected_dedupe_path(path: Path) -> bool:
+    file_name = path.name.lower()
+    return file_name.startswith(".") or file_name in PROTECTED_DEDUPE_FILENAMES
+
+
 @dataclass(frozen=True)
 class SourceSpec:
     root: str
@@ -642,7 +647,7 @@ def find_duplicate_destination_files(
 
         ordered = sorted(entries, key=sort_key)
         for duplicate in ordered[1:]:
-            if duplicate.path.name.lower() in PROTECTED_DEDUPE_FILENAMES:
+            if is_protected_dedupe_path(duplicate.path):
                 continue
             duplicate_key = os.path.realpath(str(duplicate.path)).lower()
             if duplicate_key in queued_paths:
@@ -698,8 +703,7 @@ def remove_duplicate_destination_files(
             continue
         processed_paths.add(duplicate_key)
 
-        file_name = duplicate.path.name.lower()
-        if file_name in PROTECTED_DEDUPE_FILENAMES:
+        if is_protected_dedupe_path(duplicate.path):
             if verbose:
                 print(f"[DEDUPE] Skipped protected file: {duplicate.path}")
             continue
