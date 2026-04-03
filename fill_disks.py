@@ -770,6 +770,22 @@ def build_plan(
     skipped_existing_count = 0
     seen_signatures = set(existing_signatures)
     seen_relative_paths = set(existing_relative_paths)
+    state_by_root = {state.root: state for state in target_states}
+    planning_remaining = {state.root: state.remaining_bytes for state in target_states}
+
+    def choose_planning_target(file_size: int) -> Optional[TargetState]:
+        candidate_roots = [
+            root for root, remaining in planning_remaining.items() if remaining >= file_size
+        ]
+        if not candidate_roots:
+            return None
+
+        best_gap = min(planning_remaining[root] - file_size for root in candidate_roots)
+        best_roots = [
+            root for root in candidate_roots if (planning_remaining[root] - file_size) == best_gap
+        ]
+        chosen_root = rng.choice(best_roots)
+        return state_by_root[chosen_root]
 
     for entry in pool:
         if max_files is not None and len(plan) >= max_files:
@@ -785,14 +801,14 @@ def build_plan(
             skipped_existing_count += 1
             continue
 
-        target = choose_target(target_states, entry.size, rng)
+        target = choose_planning_target(entry.size)
         if target is None:
             unplaced_count += 1
             continue
 
         destination = destination_path_for_entry(target.root, entry)
 
-        target.remaining_bytes -= entry.size
+        planning_remaining[target.root] -= entry.size
         target.planned_bytes += entry.size
         target.planned_files += 1
         seen_signatures.add(signature)

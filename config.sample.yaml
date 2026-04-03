@@ -10,16 +10,16 @@ sources:
 # So put your preferred storage first (e.g., internal storage should come first).
 targets:
   - path: "/storage/emulated/0/Music"  # Internal storage (kept in dedup)
+    reserve_mb: 10000
   - path: "/storage/external_sd1/Music"
   - path: "/storage/external_sd2/Music"
-    reserve_mb: 512
 
 # Runtime options. CLI flags override these values.
 options:
   reserve_mb: 256
   auto_detect_targets: true
   execute: false
-  allow_internal: false
+  allow_internal: true
   overwrite: false
   verbose: true
   plan_output: "plan.jsonl"
