@@ -10,8 +10,8 @@ sources:
 # So put your preferred storage first (e.g., internal storage should come first).
 targets:
   - path: "/storage/emulated/0/Music"  # Internal storage (kept in dedup)
-  - path: "/storage/external_sd1/music"
-  - path: "/storage/external_sd2/music"
+  - path: "/storage/external_sd1/Music"
+  - path: "/storage/external_sd2/Music"
     reserve_mb: 512
 
 # Runtime options. CLI flags override these values.

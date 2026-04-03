@@ -1191,7 +1191,7 @@ def main() -> int:
                     + f"failed={failed_removals} reclaimed={format_bytes(reclaimed_bytes)}"
                 )
                 if removed_count > 0:
-                    target_states = build_target_states(target_paths, reserve_mb)
+                    target_states = build_target_states(target_specs, reserve_mb)
             else:
                 apply_duplicate_reclaim_to_targets(target_states, duplicates_to_remove)
                 print(
