@@ -121,7 +121,7 @@ python fill_disks.py \
 
 ## Notes
 
-- Destination layout is target/source_alias/relative/path/to/file.
+- Destination layout is target/relative/path/to/file (relative to each source root).
 - Existing files are identified by destination relative path + size.
 - Duplicate files across destinations are removed in execute mode (one copy is kept).
 - If a destination name conflicts and sizes differ, a numbered filename is used unless --overwrite is set.

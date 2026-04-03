@@ -26,6 +26,12 @@ INTERNAL_STORAGE_PREFIXES = (
 )
 DEFAULT_CONFIG_FILENAMES = ("config.yaml", "config.yml")
 SAMPLE_CONFIG_FILENAMES = ("config.sample.yaml", "config.sample.yml")
+PROTECTED_DEDUPE_FILENAMES = {
+    ".nomedia",
+    "thumbs.db",
+    "desktop.ini",
+    ".ds_store",
+}
 
 
 @dataclass(frozen=True)
@@ -544,7 +550,7 @@ def split_relative_path(relative_path: str) -> list[str]:
 
 
 def destination_relative_path_for_entry(entry: SourceFile) -> str:
-    return f"{entry.source_alias}/{entry.relative_path}".replace("\\", "/")
+    return entry.relative_path.replace("\\", "/")
 
 
 def make_file_signature(relative_path: str, size: int) -> FileSignature:
@@ -635,6 +641,8 @@ def find_duplicate_destination_files(
 
         ordered = sorted(entries, key=sort_key)
         for duplicate in ordered[1:]:
+            if duplicate.path.name.lower() in PROTECTED_DEDUPE_FILENAMES:
+                continue
             duplicates_to_remove.append(duplicate)
             reclaimable_bytes += duplicate.size
 
@@ -657,13 +665,40 @@ def apply_duplicate_reclaim_to_targets(
 
 def remove_duplicate_destination_files(
     duplicates_to_remove: list[DestinationFile],
+    allowed_target_roots: list[Path],
     verbose: bool,
 ) -> tuple[int, int, int]:
     removed_count = 0
     reclaimed_bytes = 0
     failed_count = 0
 
+    allowed_roots = [Path(os.path.realpath(str(root))) for root in allowed_target_roots]
+
+    def is_under_allowed_roots(path: Path) -> bool:
+        real_path = Path(os.path.realpath(str(path)))
+        for root in allowed_roots:
+            try:
+                real_path.relative_to(root)
+                return True
+            except ValueError:
+                continue
+        return False
+
     for duplicate in duplicates_to_remove:
+        file_name = duplicate.path.name.lower()
+        if file_name in PROTECTED_DEDUPE_FILENAMES:
+            if verbose:
+                print(f"[DEDUPE] Skipped protected file: {duplicate.path}")
+            continue
+
+        if not is_under_allowed_roots(duplicate.path):
+            failed_count += 1
+            print(
+                f"[WARN] Refusing to remove file outside configured targets: {duplicate.path}",
+                file=sys.stderr,
+            )
+            continue
+
         try:
             duplicate.path.unlink()
             removed_count += 1
@@ -709,6 +744,7 @@ def build_plan(
     rng: random.Random,
     max_files: Optional[int],
     existing_signatures: set[FileSignature],
+    existing_relative_paths: set[str],
 ) -> tuple[list[PlannedCopy], int, int]:
     pool = list(files)
     rng.shuffle(pool)
@@ -717,10 +753,16 @@ def build_plan(
     unplaced_count = 0
     skipped_existing_count = 0
     seen_signatures = set(existing_signatures)
+    seen_relative_paths = set(existing_relative_paths)
 
     for entry in pool:
         if max_files is not None and len(plan) >= max_files:
             break
+
+        relative_path = "/".join(split_relative_path(destination_relative_path_for_entry(entry)))
+        if relative_path in seen_relative_paths:
+            skipped_existing_count += 1
+            continue
 
         signature = source_signature(entry)
         if signature in seen_signatures:
@@ -738,6 +780,7 @@ def build_plan(
         target.planned_bytes += entry.size
         target.planned_files += 1
         seen_signatures.add(signature)
+        seen_relative_paths.add(relative_path)
 
         plan.append(PlannedCopy(entry=entry, target_root=target.root, destination_path=destination))
 
@@ -788,10 +831,14 @@ def ordered_copy_targets(
         else:
             others.append(state)
 
-    viable_others = sorted(others, key=lambda state: state.remaining_bytes, reverse=True)
+    viable_others = sorted(
+        [state for state in others if state.remaining_bytes >= file_size],
+        key=lambda state: state.remaining_bytes,
+        reverse=True,
+    )
 
     ordered: list[TargetState] = []
-    if preferred is not None:
+    if preferred is not None and preferred.remaining_bytes >= file_size:
         ordered.append(preferred)
     ordered.extend(viable_others)
     return ordered
@@ -1159,6 +1206,9 @@ def main() -> int:
             target_paths
         )
         existing_signatures = set(grouped_destination_files.keys())
+        existing_relative_paths = {
+            "/".join(split_relative_path(item.relative_path)) for item in destination_inventory
+        }
         duplicates_to_remove, duplicate_groups, reclaimable_bytes = find_duplicate_destination_files(
             grouped_destination_files, target_paths
         )
@@ -1184,6 +1234,7 @@ def main() -> int:
                 print("Removing duplicate destination files...")
                 removed_count, reclaimed_bytes, failed_removals = remove_duplicate_destination_files(
                     duplicates_to_remove,
+                    [Path(target_path) for target_path in target_paths],
                     verbose,
                 )
                 print(
@@ -1220,6 +1271,7 @@ def main() -> int:
             rng,
             max_files,
             existing_signatures,
+            existing_relative_paths,
         )
 
         planned_total_bytes = sum(item.entry.size for item in plan)
