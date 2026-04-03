@@ -622,6 +622,7 @@ def find_duplicate_destination_files(
     target_priority: list[str],
 ) -> tuple[list[DestinationFile], int, int]:
     duplicates_to_remove: list[DestinationFile] = []
+    queued_paths: set[str] = set()
     duplicate_groups = 0
     reclaimable_bytes = 0
 
@@ -643,6 +644,10 @@ def find_duplicate_destination_files(
         for duplicate in ordered[1:]:
             if duplicate.path.name.lower() in PROTECTED_DEDUPE_FILENAMES:
                 continue
+            duplicate_key = os.path.realpath(str(duplicate.path)).lower()
+            if duplicate_key in queued_paths:
+                continue
+            queued_paths.add(duplicate_key)
             duplicates_to_remove.append(duplicate)
             reclaimable_bytes += duplicate.size
 
@@ -671,6 +676,7 @@ def remove_duplicate_destination_files(
     removed_count = 0
     reclaimed_bytes = 0
     failed_count = 0
+    processed_paths: set[str] = set()
 
     allowed_roots = [Path(os.path.realpath(str(root))) for root in allowed_target_roots]
 
@@ -685,6 +691,13 @@ def remove_duplicate_destination_files(
         return False
 
     for duplicate in duplicates_to_remove:
+        duplicate_key = os.path.realpath(str(duplicate.path)).lower()
+        if duplicate_key in processed_paths:
+            if verbose:
+                print(f"[DEDUPE] Skipped already processed duplicate: {duplicate.path}")
+            continue
+        processed_paths.add(duplicate_key)
+
         file_name = duplicate.path.name.lower()
         if file_name in PROTECTED_DEDUPE_FILENAMES:
             if verbose:
@@ -705,6 +718,9 @@ def remove_duplicate_destination_files(
             reclaimed_bytes += duplicate.size
             if verbose:
                 print(f"[DEDUPE] Removed duplicate: {duplicate.path}")
+        except FileNotFoundError:
+            if verbose:
+                print(f"[DEDUPE] Already absent, skipping: {duplicate.path}")
         except OSError as exc:
             failed_count += 1
             print(
